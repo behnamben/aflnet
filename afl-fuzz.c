@@ -982,8 +982,6 @@ void update_state_aware_variables(struct queue_entry *q, u8 dry_run)
   //Free state sequence
   if (state_sequence) ck_free(state_sequence);
 }
-
-/* Send (mutated) messages in order to the server under test */
 int send_over_network()
 {
   int n;
@@ -991,25 +989,28 @@ int send_over_network()
   struct sockaddr_in serv_addr;
   struct sockaddr_in local_serv_addr;
 
-  //Clean up the server if needed
+  /* ********************* */
+  /* === SUT A Handling === */
+  /* ********************* */
+
+  // Clean up SUT A if needed.
   if (cleanup_script) system(cleanup_script);
 
-  //Wait a bit for the server initialization
+  // Wait for SUT A to initialize.
   usleep(server_wait_usecs);
 
-  //Clear the response buffer and reset the response buffer size
+  // Clear the SUT A response buffer and reset sizes.
   if (response_buf) {
     ck_free(response_buf);
     response_buf = NULL;
     response_buf_size = 0;
   }
-
   if (response_bytes) {
     ck_free(response_bytes);
     response_bytes = NULL;
   }
 
-  //Create a TCP/UDP socket
+  // Create a TCP/UDP socket for SUT A.
   int sockfd = -1;
   if (net_protocol == PRO_TCP)
     sockfd = socket(AF_INET, SOCK_STREAM, 0);
@@ -1017,114 +1018,248 @@ int send_over_network()
     sockfd = socket(AF_INET, SOCK_DGRAM, 0);
 
   if (sockfd < 0) {
-    PFATAL("Cannot create a socket");
+    PFATAL("Cannot create a socket for SUT A");
   }
 
-  //Set timeout for socket data sending/receiving -- otherwise it causes a big delay
-  //if the server is still alive after processing all the requests
+  // Set timeout for sending/receiving on SUT A socket.
   struct timeval timeout;
   timeout.tv_sec = 0;
   timeout.tv_usec = socket_timeout_usecs;
   setsockopt(sockfd, SOL_SOCKET, SO_SNDTIMEO, (char *)&timeout, sizeof(timeout));
 
   memset(&serv_addr, '0', sizeof(serv_addr));
-
   serv_addr.sin_family = AF_INET;
   serv_addr.sin_port = htons(net_port);
   serv_addr.sin_addr.s_addr = inet_addr(net_ip);
 
-  //This piece of code is only used for targets that send responses to a specific port number
-  //The Kamailio SIP server is an example. After running this code, the intialized sockfd 
-  //will be bound to the given local port
+  // Bind to a specific local port if required.
   if(local_port > 0) {
     local_serv_addr.sin_family = AF_INET;
     local_serv_addr.sin_addr.s_addr = INADDR_ANY;
     local_serv_addr.sin_port = htons(local_port);
-
     local_serv_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
     if (bind(sockfd, (struct sockaddr*) &local_serv_addr, sizeof(struct sockaddr_in)))  {
-      FATAL("Unable to bind socket on local source port");
+      FATAL("Unable to bind socket on local source port for SUT A");
     }
   }
 
+  // Connect to SUT A with retries.
   if(connect(sockfd, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
-    //If it cannot connect to the server under test
-    //try it again as the server initial startup time is varied
-    for (n=0; n < 1000; n++) {
-      if (connect(sockfd, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) == 0) break;
+    for (n = 0; n < 1000; n++) {
+      if (connect(sockfd, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) == 0)
+        break;
       usleep(1000);
     }
-    if (n== 1000) {
+    if (n == 1000) {
       close(sockfd);
       return 1;
     }
   }
 
-  //retrieve early server response if needed
-  if (net_recv(sockfd, timeout, poll_wait_msecs, &response_buf, &response_buf_size)) goto HANDLE_RESPONSES;
+  // Retrieve any early response from SUT A if available.
+  if (net_recv(sockfd, timeout, poll_wait_msecs, &response_buf, &response_buf_size))
+    goto HANDLE_RESPONSES_A;
 
-  //write the request messages
+  // Send each request message to SUT A and retrieve its response.
   kliter_t(lms) *it;
   messages_sent = 0;
-
   for (it = kl_begin(kl_messages); it != kl_end(kl_messages); it = kl_next(it)) {
     n = net_send(sockfd, timeout, kl_val(it)->mdata, kl_val(it)->msize);
     messages_sent++;
 
-    //Allocate memory to store new accumulated response buffer size
+    // Allocate memory for accumulating response sizes.
     response_bytes = (u32 *) ck_realloc(response_bytes, messages_sent * sizeof(u32));
 
-    //Jump out if something wrong leading to incomplete message sent
     if (n != kl_val(it)->msize) {
-      goto HANDLE_RESPONSES;
+      goto HANDLE_RESPONSES_A;
     }
 
-    //retrieve server response
+    // Retrieve SUT A's response.
     u32 prev_buf_size = response_buf_size;
     if (net_recv(sockfd, timeout, poll_wait_msecs, &response_buf, &response_buf_size)) {
-      goto HANDLE_RESPONSES;
+      goto HANDLE_RESPONSES_A;
     }
-
-    //Update accumulated response buffer size
     response_bytes[messages_sent - 1] = response_buf_size;
 
-    //set likely_buggy flag if AFLNet does not receive any feedback from the server
-    //it could be a signal of a potentiall server crash, like the case of CVE-2019-7314
-    if (prev_buf_size == response_buf_size) likely_buggy = 1;
-    else likely_buggy = 0;
+    // Set likely_buggy flag if no new data was received.
+    if (prev_buf_size == response_buf_size)
+      likely_buggy = 1;
+    else
+      likely_buggy = 0;
   }
 
-HANDLE_RESPONSES:
-
+HANDLE_RESPONSES_A:
   net_recv(sockfd, timeout, poll_wait_msecs, &response_buf, &response_buf_size);
-
   if (messages_sent > 0 && response_bytes != NULL) {
     response_bytes[messages_sent - 1] = response_buf_size;
   }
 
-  //wait a bit letting the server to complete its remaining task(s)
+  // Allow SUT A to finish remaining tasks.
   memset(session_virgin_bits, 255, MAP_SIZE);
-  while(1) {
+  while (1) {
     if (has_new_bits(session_virgin_bits) != 2) break;
   }
-
   close(sockfd);
 
-  if (likely_buggy && false_negative_reduction) return 0;
+  if (likely_buggy && false_negative_reduction)
+    return 0;
 
-  if (terminate_child && (child_pid > 0)) kill(child_pid, SIGTERM);
+  if (terminate_child && (child_pid > 0))
+    kill(child_pid, SIGTERM);
 
-  //give the server a bit more time to gracefully terminate
-  while(1) {
+  while (1) {
     int status = kill(child_pid, 0);
     if ((status != 0) && (errno == ESRCH)) break;
   }
 
+  /* ********************************************* */
+  /* === SUT B Handling: Duplicate of SUT A Flow === */
+  /* ********************************************* */
+
+  // Start SUT B using its startup script.
+  if (sutb_start_script)
+    system(sutb_start_script);
+
+  // Wait for SUT B to initialize.
+  usleep(sutb_server_wait_usecs);
+
+  // Variables for SUT B responses.
+  u8 *response_buf_b = NULL;
+  u32 response_buf_size_b = 0;
+  u32 *response_bytes_b = NULL;
+  int messages_sent_b = 0;
+
+  // Create a TCP/UDP socket for SUT B.
+  int sockfd_b = -1;
+  if (net_protocol == PRO_TCP)
+    sockfd_b = socket(AF_INET, SOCK_STREAM, 0);
+  else if (net_protocol == PRO_UDP)
+    sockfd_b = socket(AF_INET, SOCK_DGRAM, 0);
+
+  if (sockfd_b < 0) {
+    PFATAL("Cannot create a socket for SUT B");
+  }
+
+  // Reuse the same timeout settings for SUT B.
+  setsockopt(sockfd_b, SOL_SOCKET, SO_SNDTIMEO, (char *)&timeout, sizeof(timeout));
+
+  // Set up SUT B's address (using sutb_net_ip and sutb_net_port).
+  struct sockaddr_in sutb_addr;
+  memset(&sutb_addr, '0', sizeof(sutb_addr));
+  sutb_addr.sin_family = AF_INET;
+  sutb_addr.sin_port = htons(sutb_net_port);
+  sutb_addr.sin_addr.s_addr = inet_addr(sutb_net_ip);
+
+  // Connect to SUT B with retries.
+  if(connect(sockfd_b, (struct sockaddr *)&sutb_addr, sizeof(sutb_addr)) < 0) {
+    for (n = 0; n < 1000; n++) {
+      if (connect(sockfd_b, (struct sockaddr *)&sutb_addr, sizeof(sutb_addr)) == 0)
+        break;
+      usleep(1000);
+    }
+    if (n == 1000) {
+      close(sockfd_b);
+      return 1;
+    }
+  }
+
+  // Retrieve any early response from SUT B if available.
+  if (net_recv(sockfd_b, timeout, poll_wait_msecs, &response_buf_b, &response_buf_size_b))
+    goto HANDLE_RESPONSES_B;
+
+  // Send each request message to SUT B and retrieve its response.
+  kliter_t(lms) *it2;
+  for (it2 = kl_begin(kl_messages); it2 != kl_end(kl_messages); it2 = kl_next(it2)) {
+    n = net_send(sockfd_b, timeout, kl_val(it2)->mdata, kl_val(it2)->msize);
+    messages_sent_b++;
+
+    // Allocate memory to store accumulated response sizes for SUT B.
+    response_bytes_b = (u32 *) ck_realloc(response_bytes_b, messages_sent_b * sizeof(u32));
+
+    if (n != kl_val(it2)->msize) {
+      goto HANDLE_RESPONSES_B;
+    }
+
+    // Retrieve SUT B's response.
+    u32 prev_buf_size_b = response_buf_size_b;
+    if (net_recv(sockfd_b, timeout, poll_wait_msecs, &response_buf_b, &response_buf_size_b)) {
+      goto HANDLE_RESPONSES_B;
+    }
+    response_bytes_b[messages_sent_b - 1] = response_buf_size_b;
+  }
+
+HANDLE_RESPONSES_B:
+  net_recv(sockfd_b, timeout, poll_wait_msecs, &response_buf_b, &response_buf_size_b);
+  if (messages_sent_b > 0 && response_bytes_b != NULL) {
+    response_bytes_b[messages_sent_b - 1] = response_buf_size_b;
+  }
+
+  // Allow SUT B to finish remaining tasks.
+  memset(session_virgin_bits, 255, MAP_SIZE);
+  while (1) {
+    if (has_new_bits(session_virgin_bits) != 2) break;
+  }
+  close(sockfd_b);
+
+  // Kill SUT B using its kill script or PID.
+  if (sutb_kill_script)
+    system(sutb_kill_script);
+  else if (sutb_child_pid > 0)
+    kill(sutb_child_pid, SIGTERM);
+
+  while (1) {
+    int status = kill(sutb_child_pid, 0);
+    if ((status != 0) && (errno == ESRCH)) break;
+  }
+
+  /* *********************************************** */
+  /* === Compare Responses & Log Differences     === */
+  /* *********************************************** */
+
+  // Compare the responses from SUT A and SUT B.
+  // We assume that response_buf/response_buf_size and response_buf_b/response_buf_size_b
+  // hold the final responses from SUT A and SUT B, respectively.
+  if (response_buf_size != response_buf_size_b ||
+      memcmp(response_buf, response_buf_b, response_buf_size) != 0)
+  {
+    // Open log file in append mode so we don't override previous entries.
+    FILE *diff_fp = fopen("diff_log.txt", "a");
+    if (diff_fp) {
+      fprintf(diff_fp, "=== Difference Detected ===\n");
+
+      // Log the sent messages.
+      fprintf(diff_fp, "Sent Messages:\n");
+      for (it = kl_begin(kl_messages); it != kl_end(kl_messages); it = kl_next(it)) {
+        fprintf(diff_fp, "Message (size %u): ", kl_val(it)->msize);
+        // Print message data as hexadecimal.
+        for (unsigned int j = 0; j < kl_val(it)->msize; j++) {
+          fprintf(diff_fp, "%02X ", ((unsigned char*)kl_val(it)->mdata)[j]);
+        }
+        fprintf(diff_fp, "\n");
+      }
+
+      // Log SUT A's response.
+      fprintf(diff_fp, "SUT A Response (%u bytes):\n", response_buf_size);
+      for (unsigned int i = 0; i < response_buf_size; i++) {
+        fprintf(diff_fp, "%02X ", ((unsigned char*)response_buf)[i]);
+      }
+      fprintf(diff_fp, "\n");
+
+      // Log SUT B's response.
+      fprintf(diff_fp, "SUT B Response (%u bytes):\n", response_buf_size_b);
+      for (unsigned int i = 0; i < response_buf_size_b; i++) {
+        fprintf(diff_fp, "%02X ", ((unsigned char*)response_buf_b)[i]);
+      }
+      fprintf(diff_fp, "\n----------------------------------\n");
+      fclose(diff_fp);
+    }
+  }
+
+  // Return 0 to indicate success.
   return 0;
 }
-/* End of AFLNet-specific variables & functions */
 
-/* Get unix time in milliseconds */
+
 
 static u64 get_cur_time(void) {
 
